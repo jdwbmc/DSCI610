@@ -1,0 +1,653 @@
+---
+title: "FinalPaper"
+author: "John D Williams"
+date: "2026-03-31"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Final Paper
+```{r}
+#Load Libraries
+if (!require("tidyverse")) install.packages("tidyverse")
+library(tidyverse)
+if (!require("MASS")) install.packages("MASS")
+library(MASS)
+if (!require("ggplot2")) install.packages("ggplot2")
+library(ggplot2)
+if (!require("broom")) install.packages("broom")
+library(broom)
+```
+
+## Read File 1
+```{r}
+df1 <- read_csv("CensusMCD.csv")
+```
+
+## Start cleaning process
+```{r}
+# 1. Convert Year to integer and Drop the Notes column
+df1 <- df1 %>%
+  mutate(Year = as.integer(Year))
+
+# 2. Replace the text "Suppressed" with "5"  (the mean(Deaths))
+df1$Deaths[df1$Deaths == "Suppressed"] <- "5"
+
+# 3. Convert the entire Deaths column to numeric
+df1$Deaths <- as.integer(df1$Deaths)
+
+#Fix Race
+# 4. We use mutate with ifelse (or case_when) to overwrite the values
+df1 <- df1 %>%
+  mutate(
+    # Ensure both columns are strings to avoid type errors
+    `Hispanic Origin` = as.character(`Hispanic Origin`),
+    Race = as.character(Race),
+    
+    # Use case_when to precisely map the new Race values
+    Race = case_when(
+      `Hispanic Origin` == "Hispanic or Latino" ~ "Hispanic",
+      `Hispanic Origin` == "Not Hispanic or Latino" ~ Race,
+      is.na(`Hispanic Origin`) ~ Race, # Keeps original Race if Hispanic info is missing
+      TRUE ~ Race                     # Safety net: keep original value otherwise
+    ),
+    
+    # Do the same for the Codes
+    `Race Code` = case_when(
+      `Hispanic Origin` == "Hispanic or Latino" ~ `Hispanic Origin Code`,
+      TRUE ~ as.character(`Race Code`)
+    )
+  )
+
+# 5. Verification check
+# This should now show "Hispanic", "White", "Black", AND "American Indian..."
+unique(df1$Race)
+
+# 6. Drop columns by name
+df1_cleaned <- df1[, !(names(df1) %in% c("Hispanic Origin", "Hispanic Origin Code", "Notes"))]
+
+# 7. Drop rows 2113 through 2200
+df1_cleaned <- df1_cleaned %>%
+  slice(-(2113:2200))
+
+# See the count of each category
+table(df1_cleaned$`Crude Rate`)
+
+# See the count of each category
+table(df1_cleaned$Deaths)
+
+# See the count of each category
+table(df1_cleaned$Race)
+
+```
+
+## Now do the same for all who died because of cirrosis
+
+### Read File 2
+```{r}
+df2 <- read_csv("CensusOnlyK.csv")
+```
+
+## Start cleaning process for file 2
+```{r}
+# 1. Convert Year to integer and Drop the Notes column
+df2 <- df2 %>%
+  mutate(Year = as.integer(Year))
+
+# 2. Replace the text "Suppressed" with "5"  (the mean(Deaths))
+df2$Deaths[df2$Deaths == "Suppressed"] <- "5"
+
+# 3. Convert the entire Deaths column to numeric
+df2$Deaths <- as.integer(df2$Deaths)
+
+#Fix Race
+# 4. We use mutate with ifelse (or case_when) to overwrite the values
+df2 <- df2 %>%
+  mutate(
+    # Ensure both columns are strings to avoid type errors
+    `Hispanic Origin` = as.character(`Hispanic Origin`),
+    Race = as.character(Race),
+    
+    # Use case_when to precisely map the new Race values
+    Race = case_when(
+      `Hispanic Origin` == "Hispanic or Latino" ~ "Hispanic",
+      `Hispanic Origin` == "Not Hispanic or Latino" ~ Race,
+      is.na(`Hispanic Origin`) ~ Race, # Keeps original Race if Hispanic info is missing
+      TRUE ~ Race                     # Safety net: keep original value otherwise
+    ),
+    
+    # Do the same for the Codes
+    `Race Code` = case_when(
+      `Hispanic Origin` == "Hispanic or Latino" ~ `Hispanic Origin Code`,
+      TRUE ~ as.character(`Race Code`)
+    )
+  )
+
+# 5. Verification check
+# This should now show "Hispanic", "White", "Black", AND "American Indian..."
+unique(df2$Race)
+
+# 6. Drop columns by name
+df2_cleaned <- df2[, !(names(df2) %in% c("Hispanic Origin", "Hispanic Origin Code", "Notes"))]
+
+# 7. Drop rows 2113 through 2192
+df2_cleaned <- df2_cleaned %>%
+  slice(-(2113:2192))
+```
+
+## Fix Population 'Not Applicable' problem for df1 using values in df2
+```{r}
+# 1. Ensure Population is numeric (NAs will replace "Not Applicable")
+df1_cleaned <- df1_cleaned %>%
+  mutate(Population = as.numeric(gsub("[^0-9]", "", Population)))
+
+df2_cleaned <- df2_cleaned %>%
+  mutate(Population = as.numeric(gsub("[^0-9]", "", Population)))
+
+# 2. Join the two datasets on your matching columns
+# We use left_join to keep all 2112 rows of df1
+df1_patched <- df1_cleaned %>%
+  left_join(
+    df2_cleaned %>% dplyr::select(Year, `Census Region`, Race, Sex, Population), 
+    by = c("Year", "Census Region", "Race", "Sex"),
+    suffix = c("_df1", "_df2")
+  ) %>%
+  # 3. Use coalesce to fill the holes
+  mutate(Population = coalesce(Population_df1, Population_df2)) %>%
+  # 4. Clean up the temporary columns
+  dplyr::select(-Population_df1, -Population_df2)
+
+# 5. Verify: How many NAs are left?
+sum(is.na(df1_patched$Population))
+```
+
+## More df1 Cleanup
+```{r}
+# We use group_by to ensure we only fill within the same demographic bucket
+df1_patched <- df1_patched %>%
+  group_by(`Census Region`, Race, Sex) %>%
+  arrange(Year) %>%
+  # fill() looks at the nearest non-NA value and carries it forward or backward
+  fill(Population, .direction = "downup") %>%
+  ungroup()
+
+# Check the count again
+sum(is.na(df1_patched$Population))
+
+#Calculate Your Final Rates
+df1_final <- df1_patched %>%
+  mutate(
+    # Calculate the rate: (Deaths / Population) * 100,000
+    Calculated_Crude_Rate = (Deaths / Population) * 100000
+  )
+```
+
+## Fix df2_cleaned for the same items
+```{r}
+# 1. First, make sure Deaths in df2 are numeric (handling Suppressed/Unreliable)
+df2_cleaned <- df2_cleaned %>%
+  mutate(
+    Deaths = case_when(
+      Deaths == "Suppressed" ~ 5,
+      Deaths == "Unreliable" ~ 15,
+      TRUE ~ as.numeric(Deaths)
+    )
+  )
+
+# 2. Join df2 with the "good" population from your patched df1
+df2_final <- df2_cleaned %>%
+  dplyr::select(-Population) %>% # Drop the old "dirty" population
+  left_join(
+    df1_final %>% dplyr::select(Year, `Census Region`, Race, Sex, Population), 
+    by = c("Year", "Census Region", "Race", "Sex")
+  )
+
+# 3. Re-calculate the Crude Rate for df2
+df2_final <- df2_final %>%
+  mutate(Calculated_Crude_Rate = (Deaths / Population) * 100000)
+
+# 4. Final Audit
+sum(is.na(df2_final$Population))
+```
+
+## More Checking
+```{r}
+#The Final "Sanity Check"
+df2_final %>%
+  group_by(Race) %>%
+  summarise(
+    Avg_Crude_Rate_Total = mean(Calculated_Crude_Rate, na.rm = TRUE),
+    Total_Deaths_Estimated = sum(Deaths, na.rm = TRUE)
+  ) %>%
+  arrange(desc(Avg_Crude_Rate_Total))
+
+
+# Quick check: See the top rates by Race
+df1_final %>%
+  group_by(Race) %>%
+  summarise(Avg_Crude_Rate = mean(Calculated_Crude_Rate)) %>%
+  arrange(desc(Avg_Crude_Rate))
+
+#A check of values
+df2_final %>%
+  group_by(Race) %>%
+  summarise(Total_Pop = sum(Population, na.rm = TRUE))
+```
+
+## Aggregate Rates
+```{r}
+#The "Correct" Way to Calculate Aggregate Rates
+Master_Summary <- df2_final %>%
+  group_by(Race) %>%
+  summarise(
+    Grand_Total_Deaths = sum(Deaths, na.rm = TRUE),
+    Grand_Total_Pop = sum(Population, na.rm = TRUE)
+  ) %>%
+  mutate(
+    True_Crude_Rate = (Grand_Total_Deaths / Grand_Total_Pop) * 100000
+  ) %>%
+  arrange(desc(True_Crude_Rate))
+
+print(Master_Summary)
+```
+
+## The Comparison: "Total" vs. "Both"
+```{r}
+# Calculate weighted rates for the comorbidity dataset
+Both_Summary <- df1_final %>%
+  group_by(Race) %>%
+  summarise(
+    Both_Deaths = sum(Deaths, na.rm = TRUE),
+    Both_Pop = sum(Population, na.rm = TRUE)
+  ) %>%
+  mutate(
+    Both_True_Rate = (Both_Deaths / Both_Pop) * 100000
+  )
+
+# Join them to see the final contribution
+Final_Comparison <- Master_Summary %>%
+  left_join(Both_Summary, by = "Race") %>%
+  mutate(
+    Diabetes_Contribution_Percent = (Both_Deaths / Grand_Total_Deaths) * 100
+  )
+
+print(Final_Comparison %>% dplyr::select(Race, True_Crude_Rate, 
+  Both_True_Rate, Diabetes_Contribution_Percent))
+```
+
+## The Negative Binomial Regression
+```{r}
+# 0. Combine your two cleaned datasets into one master file
+analysis_df <- df1_final %>%
+  rename(Deaths_Both = Deaths) %>%
+  # We select only the necessary columns from df2 to avoid 'doubling up' on population
+  left_join(
+    df2_final %>% dplyr::select(Year, `Census Region`, Race, Sex, Population),
+    by = c("Year", "Census Region", "Race", "Sex", "Population")
+  )
+
+# Verify it exists now
+head(analysis_df)
+# 1. Ensure Race is a 'factor' and set 'White' as the baseline for comparison
+analysis_df$Race <- factor(analysis_df$Race)
+analysis_df$Race <- relevel(analysis_df$Race, ref = "White")
+
+# 2. Run the Model
+# We predict 'Deaths_Both' using 'Race' and 'Sex'
+# We use log(Population) as an offset to calculate the RATE
+nb_model <- glm.nb(Deaths_Both ~ Race + Sex + Year + offset(log(Population)), 
+                   data = analysis_df)
+
+# 3. See the results
+summary(nb_model)
+```
+
+## Forest Plot
+```{r}
+# 1. Clean up the model results for plotting
+plot_data <- tidy(nb_model, conf.int = TRUE, exponentiate = TRUE) %>%
+  filter(term != "(Intercept)" & term != "Year") # Focus on Race and Sex
+
+# 2. Create the Forest Plot - P1
+ggplot(plot_data, aes(x = estimate, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "red") + # The 'Null' line
+  geom_point(size = 3, color = "darkblue") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  theme_minimal() + 
+  theme(plot.margin = margin(10, 100, 10, 10)) +
+  labs(
+    title = "Incidence Rate Ratios (IRR) for Cirrhosis-Diabetes Mortality",
+    subtitle = "Reference Group: White | Adjusted for Year and Sex",
+    x = "Risk Ratio (Exponential Coefficients)",
+    y = "Demographic Variable"
+  )
+```
+
+## Line Graph over Time
+```{r}
+# Create a line graph over time - P2
+ggplot(df1_final, aes(x = Year, y = Calculated_Crude_Rate, color = Race)) +
+  geom_smooth(se = FALSE, method = "loess") + # Smooths the lines to show the trend
+  theme_minimal() +
+  labs(
+    title = "Mortality Trends: Cirrhosis and Type 2 Diabetes (1999-2020)",
+    subtitle = "Aggregated by Race and Ethnicity",
+    y = "Crude Rate per 100,000",
+    x = "Year"
+  )
+```
+
+## The Regional Risk Heatmap
+```{r}
+#Prep for the heatmap
+regional_analysis <- analysis_df %>%
+  group_by(`Census Region`, Race) %>%
+  summarise(
+    Total_Deaths = sum(Deaths_Both, na.rm = TRUE),
+    # Using the calculated rate from df1_final
+    Avg_Rate = mean(Calculated_Crude_Rate, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Create the Heatmap - P3
+ggplot(regional_analysis, aes(x = `Census Region`, y = Race, fill = Avg_Rate)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "firebrick") +
+  theme_minimal() +
+  theme(plot.margin = margin(10, 100, 10, 10)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Mortality Hotspots: Cirrhosis & Type 2 Diabetes",
+    subtitle = "Average Crude Rate by Region and Race",
+    fill = "Mortality Rate",
+    x = "US Census Region",
+    y = "Race/Ethnicity"
+  )
+```
+
+## The Ratio Plot
+```{r}
+#One Last "New" Trick: The Ratio Plot - P4
+analysis_df %>%
+  group_by(`Census Region`, Race) %>%
+  summarise(
+    # What % of the Population is dying from this?
+    Regional_Rate = (sum(Deaths_Both) / sum(Population)) * 100000,
+    .groups = 'drop'
+  ) %>%
+  filter(Race %in% c("American Indian or Alaska Native", "White", "Hispanic", "Black or African American")) %>%
+  ggplot(aes(x = `Census Region`, y = Regional_Rate, fill = Race)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Regional Mortality Rates by Race",
+       y = "Deaths per 100,000",
+       x = "Region")
+```
+
+## The "Inequality Ratio" by Region
+```{r}
+#Prep the data
+regional_disparity <- analysis_df %>%
+  group_by(`Census Region`, Race) %>%
+  summarise(
+    # Use the aggregate calculation (Sum of Deaths / Sum of Population)
+    Agg_Rate = (sum(Deaths_Both) / sum(Population)) * 100000,
+    .groups = 'drop'
+  ) %>%
+  # Pivot the data to compare Race vs White
+  tidyr::pivot_wider(names_from = Race, values_from = Agg_Rate) %>%
+  mutate(
+    AIAN_Disparity_Ratio = `American Indian or Alaska Native` / White,
+    Hispanic_Disparity_Ratio = Hispanic / White
+  )
+
+# View the ratios
+print(regional_disparity %>% dplyr::select(`Census Region`,
+ AIAN_Disparity_Ratio, Hispanic_Disparity_Ratio))
+```
+
+## The Final "Disparity Comparison" Plot
+```{r}
+# 1. Prepare the data for a side-by-side plot
+plot_final <- regional_disparity %>%
+  dplyr::select(`Census Region`, AIAN_Disparity_Ratio, Hispanic_Disparity_Ratio) %>%
+  pivot_longer(cols = ends_with("Ratio"), 
+               names_to = "Demographic_Group", 
+               values_to = "Disparity_Ratio") %>%
+  # Clean up labels for the legend
+  mutate(Demographic_Group = ifelse(Demographic_Group == "AIAN_Disparity_Ratio", 
+                                   "Amer. Indian / AK Native", "Hispanic"))
+
+# 2. Create the Visual - P5
+ggplot(plot_final, aes(x = `Census Region`, y = Disparity_Ratio, fill = Demographic_Group)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black", alpha = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", size = 1) +
+  annotate("text", x = 0.7, y = 1.3, label = "Baseline (White)", color = "red", fontface = "italic") +
+  scale_fill_manual(values = c("Amer. Indian / AK Native" = "#b2182b", "Hispanic" = "#2166ac")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 10),
+    legend.position = "top",
+    plot.title = element_text(face = "bold", size = 14)
+  ) +
+  labs(
+    title = "Regional Disparities in Cirrhosis-Diabetes Mortality",
+    subtitle = "Relative Risk Compared to White Population (1.0 = Equality)",
+    x = "US Census Region",
+    y = "Disparity Ratio (Rate / White Rate)",
+    fill = "Target Group"
+  )
+```
+
+## Line Graph for Races
+```{r}
+# 1. Calculate the aggregate rate for each race per year
+yearly_trends <- analysis_df %>%
+  group_by(Year, Race) %>%
+  summarise(
+    Total_Deaths = sum(Deaths_Both, na.rm = TRUE),
+    Total_Pop = sum(Population, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(Yearly_Rate = (Total_Deaths / Total_Pop) * 100000)
+
+# 2. Plot the line graph - P6
+ggplot(yearly_trends, aes(x = Year, y = Yearly_Rate, color = Race, group = Race)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Trends in Cirrhosis-Diabetes Mortality (1999–2020)",
+    subtitle = "Crude Death Rates per 100,000 by Racial/Ethnic Group",
+    x = "Year",
+    y = "Death Rate (per 100k)",
+    color = "Race/Ethnicity"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+## The National Trend
+```{r}
+# 1. Aggregate everything by Year to get the national average
+national_trend <- analysis_df %>%
+  group_by(Year) %>%
+  summarise(
+    Total_Deaths = sum(Deaths_Both, na.rm = TRUE),
+    Total_Pop = sum(Population, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(National_Rate = (Total_Deaths / Total_Pop) * 100000)
+
+# 2. Create the "Surge" Line Graph - P7
+ggplot(national_trend, aes(x = Year, y = National_Rate)) +
+  geom_line(linewidth = 1.5, color = "darkred") +
+  geom_point(size = 3, color = "darkred") +
+  # Adding a trend line to show the "Slope of the Crisis"
+  geom_smooth(method = "lm", linetype = "dashed", color = "gray40", se = FALSE) +
+  theme_minimal() +
+  labs(
+    title = "The National Surge: Cirrhosis-Diabetes Comorbidity",
+    subtitle = "Aggregated Death Rate per 100,000 (1999–2020)",
+    x = "Year",
+    y = "National Death Rate (per 100k)",
+    caption = "Dashed line represents the overall linear trend."
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+## Sensitivity Analysis (The "Imputation" Check)
+```{r}
+# 1. Filter out the rows that were originally suppressed (where deaths were 5 or 15)
+robust_df <- analysis_df %>% filter(Deaths_Both > 15)
+
+# 2. Re-run the model
+nb_model_robust <- glm.nb(Deaths_Both ~ Race + Sex + Year + offset(log(Population)), 
+                          data = robust_df)
+
+# 3. Compare the IRRs
+summary(nb_model_robust)
+```
+
+## Predicted vs. Observed plot
+```{r}
+# Compare the model's predictions to the actual death counts - P8
+analysis_df$predicted_deaths <- predict(nb_model, type = "response")
+
+ggplot(analysis_df, aes(x = Deaths_Both, y = predicted_deaths)) +
+  geom_point(alpha = 0.3, color = "darkblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Model Diagnostic: Predicted vs. Observed Deaths",
+       x = "Actual Death Counts",
+       y = "Model Predicted Counts")
+```
+
+## Prediction for 2026
+```{r}
+# First, let's check what data we actually have
+# Create a clean trend plot with proper data
+# Based on your code, I see you have yearly_trends data
+
+# Create a clean national trend excluding 2020 outlier
+cleaned_national_trend <- national_trend %>%
+  filter(Year != 2020)  # Remove 2020 outlier
+
+# Fit a proper linear model for trend
+model <- lm(National_Rate ~ Year, data = cleaned_national_trend)
+slope <- coef(model)[2]
+intercept <- coef(model)[1]
+
+# Predict 2026 rate
+predicted_2026_rate <- intercept + slope * 2026
+
+# Calculate percent increase from 2019 to 2026 (using 2019 as baseline)
+actual_2019_rate <- national_trend %>% filter(Year == 2019) %>% pull(National_Rate)
+percent_increase <- ((predicted_2026_rate - actual_2019_rate) / actual_2019_rate) * 100
+```
+
+## Print Results
+```{r}
+# Print results
+cat("Predicted rate for 2026:", round(predicted_2026_rate, 2), "\n")
+cat("Percent increase from 2019 to 2026:", round(percent_increase, 2), "%\n")
+```
+
+## Prep the data
+```{r}
+# Create the complete plot that shows the trend and prediction
+# Get the actual data points
+actual_data <- national_trend %>%
+  mutate(Type = "Actual")
+
+# Create future predictions
+future_data <- data.frame(
+  Year = 2021:2026,
+  National_Rate = predict(model, newdata = data.frame(Year = 2021:2026)),
+  Type = "Predicted"
+)
+
+# Combine all data
+all_data <- bind_rows(actual_data, future_data)
+```
+
+
+## Create Initial Prediction graph
+```{r}
+# Create the final plot with proper x-axis
+ggplot(all_data, aes(x = Year, y = National_Rate, color = Type)) +
+  geom_line(size = 1.2, aes(linetype = Type)) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 2020, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 2026, linetype = "dashed", color = "gray50") +
+  scale_linetype_manual(values = c("Actual" = "solid", "Predicted" = "dashed")) +
+  theme_minimal() +
+  labs(title = "National Trend in Cirrhosis-Diabetes Mortality (1999-2026)",
+       subtitle = paste("Prediction for 2026:", round(predicted_2026_rate, 2), 
+                       "per 100,000 | Increase:", round(percent_increase, 1), "%"),
+       x = "Year",
+       y = "National Death Rate (per 100,000)",
+       color = "Data Type",
+       linetype = "Data Type") +
+  theme(plot.title = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(size = 12),
+        legend.position = "bottom")
+```
+
+## Line Plot Graph
+```{r}
+# Also create a simple line plot showing the trend
+ggplot(national_trend, aes(x = Year, y = National_Rate)) +
+  geom_line(size = 1.2, color = "darkblue") +
+  geom_point(size = 3, color = "darkblue") +
+  geom_line(data = data.frame(Year = 2021:2026, 
+                              National_Rate = predict(model, newdata = data.frame(Year = 2021:2026))),
+            aes(x = Year, y = National_Rate), 
+            color = "red", linetype = "dashed", size = 1.2) +
+  geom_point(data = data.frame(Year = 2021:2026, 
+                               National_Rate = predict(model, newdata = data.frame(Year = 2021:2026))),
+             aes(x = Year, y = National_Rate), 
+             color = "red", size = 3) +
+  theme_minimal() +
+  labs(title = "National Trend in Cirrhosis-Diabetes Mortality (1999-2026)",
+       subtitle = "Historical data with 2026 prediction",
+       x = "Year",
+       y = "National Death Rate (per 100,000)") +
+  theme(plot.title = element_text(face = "bold", size = 16))
+```
+
+## Simpler Analysis
+```{r}
+# Simple approach using the last few years to predict
+# Use 2018-2019 data to get trend
+recent_data <- national_trend %>%
+  filter(Year >= 2018 & Year <= 2020) %>%
+  filter(Year != 2020)  # Remove 2020 outlier
+
+# Fit model on recent data
+model_recent <- lm(National_Rate ~ Year, data = recent_data)
+slope_recent <- coef(model_recent)[2]
+intercept_recent <- coef(model_recent)[1]
+
+# Predict 2026
+predicted_2026_rate_recent <- intercept_recent + slope_recent * 2026
+
+# Calculate percent increase from 2019 to 2026
+actual_2019_rate <- national_trend %>% filter(Year == 2019) %>% pull(National_Rate)
+percent_increase_recent <- ((predicted_2026_rate_recent - actual_2019_rate) / actual_2019_rate) * 100
+
+cat("Predicted rate for 2026 (using 2018-2019 trend):", round(predicted_2026_rate_recent, 2), "\n")
+cat("Percent increase from 2019 to 2026:", round(percent_increase_recent, 2), "%\n")
+```
+
